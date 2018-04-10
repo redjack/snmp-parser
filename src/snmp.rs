@@ -263,7 +263,7 @@ pub fn parse_objectsyntax<'a>(i:&'a[u8]) -> IResult<&'a[u8],ObjectSyntax> {
                             |x:DerObjectContent| {
                                 x.as_u64().map(|x| {
                                     match hdr.tag {
-                                        1 => ObjectSyntax::Counter64(x),
+                                        6 => ObjectSyntax::Counter64(x),
                                         _ => unreachable!(),
                                     }
                                 })
