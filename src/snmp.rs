@@ -91,6 +91,13 @@ pub enum NetworkAddress {
 /// counters.
 pub type Counter = u32;
 
+/// This application-wide type represents a non-negative integer which
+/// monotonically increases until it reaches a maximum value, when it
+/// wraps around and starts increasing again from zero.  This memo
+/// specifies a maximum value of 2^64-1 (18446744073709551615 decimal) for
+/// larger counters.
+pub type Counter64 = u64;
+
 /// This application-wide type represents a non-negative integer, which
 /// may increase or decrease, but which latches at a maximum value.  This
 /// memo specifies a maximum value of 2^32-1 (4294967295 decimal) for
@@ -204,6 +211,7 @@ pub enum ObjectSyntax<'a> {
     Empty,
     Address(NetworkAddress),
     Counter(Counter),
+    Counter64(Counter64),
     Gauge(Gauge),
     Ticks(TimeTicks),
     Arbitrary(DerObject<'a>),
@@ -247,6 +255,20 @@ fn parse_objectsyntax<'a>(i:&'a[u8]) -> IResult<&'a[u8],ObjectSyntax> {
                     4 => {
                         let r = der_read_element_content_as(rem, DerTag::OctetString as u8, hdr.len as usize);
                         r.map(|x| ObjectSyntax::Arbitrary(DerObject::from_obj(x)))
+                    },
+                    6 => {
+                        map_res!(
+                            rem,
+                            apply!(der_read_element_content_as, DerTag::Integer as u8, hdr.len as usize),
+                            |x:DerObjectContent| {
+                                x.as_u64().map(|x| {
+                                    match hdr.tag {
+                                        1 => ObjectSyntax::Counter64(x),
+                                        _ => unreachable!(),
+                                    }
+                                })
+                            }
+                        )
                     },
                     _ => IResult::Error(error_code!(ErrorKind::Custom(DER_TAG_ERROR))),
                 }
