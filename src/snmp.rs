@@ -9,11 +9,9 @@
 use std::{fmt,str};
 use std::net::Ipv4Addr;
 use std::slice::Iter;
-use nom::{IResult,ErrorKind};
+use nom::{IResult,Err,ErrorKind};
 use der_parser::*;
 use der_parser::oid::Oid;
-
-use error::SnmpError;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct PduType(pub u8);
@@ -79,7 +77,7 @@ impl fmt::Debug for TrapType {
 /// This CHOICE represents an address from one of possibly several
 /// protocol families.  Currently, only one protocol family, the Internet
 /// family, is present in this CHOICE.
-#[derive(Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum NetworkAddress {
     IPv4(Ipv4Addr),
 }
@@ -147,6 +145,14 @@ pub struct SnmpGenericPdu<'a> {
 }
 
 #[derive(Debug,PartialEq)]
+pub struct SnmpBulkPdu<'a> {
+    pub req_id: u32,
+    pub non_repeaters: u32,
+    pub max_repetitions: u32,
+    pub var: Vec<SnmpVariable<'a>>,
+}
+
+#[derive(Debug,PartialEq)]
 pub struct SnmpTrapPdu<'a> {
     pub enterprise: Oid,
     pub agent_addr: NetworkAddress,
@@ -159,7 +165,15 @@ pub struct SnmpTrapPdu<'a> {
 #[derive(Debug,PartialEq)]
 pub enum SnmpPdu<'a> {
     Generic(SnmpGenericPdu<'a>),
+    Bulk(SnmpBulkPdu<'a>),
     TrapV1(SnmpTrapPdu<'a>),
+}
+
+#[derive(Debug,PartialEq)]
+pub struct SnmpMessage<'a> {
+    pub version: u32,
+    pub community: String,
+    pub pdu: SnmpPdu<'a>,
 }
 
 impl<'a> SnmpGenericPdu<'a> {
@@ -174,26 +188,31 @@ impl<'a> SnmpTrapPdu<'a> {
     }
 }
 
-impl<'a> SnmpMessage<'a> {
+impl<'a> SnmpPdu<'a> {
+    pub fn pdu_type(&self) -> PduType {
+        match *self {
+            SnmpPdu::Generic(ref pdu) => pdu.pdu_type,
+            SnmpPdu::Bulk(_)          => PduType::GetBulkRequest,
+            SnmpPdu::TrapV1(_)        => PduType::TrapV1,
+        }
+    }
+
     pub fn vars_iter(&'a self) -> Iter<SnmpVariable> {
-        match self.parsed_pdu {
+        match *self {
             SnmpPdu::Generic(ref pdu) => pdu.var.iter(),
+            SnmpPdu::Bulk(ref pdu)    => pdu.var.iter(),
             SnmpPdu::TrapV1(ref pdu)  => pdu.var.iter(),
         }
     }
 }
 
-#[derive(Debug,PartialEq)]
-pub struct SnmpMessage<'a> {
-    pub version: u32,
-    pub community: &'a[u8],
-    pub pdu_type: PduType,
-    pub parsed_pdu: SnmpPdu<'a>,
-}
-
 impl<'a> SnmpMessage<'a> {
-    pub fn get_community(self: &SnmpMessage<'a>) -> &'a str {
-        str::from_utf8(self.community).unwrap()
+    pub fn pdu_type(&self) -> PduType {
+        self.pdu.pdu_type()
+    }
+
+    pub fn vars_iter(&'a self) -> Iter<SnmpVariable> {
+        self.pdu.vars_iter()
     }
 }
 
@@ -217,9 +236,23 @@ pub enum ObjectSyntax<'a> {
     Arbitrary(DerObject<'a>),
 }
 
-pub fn parse_objectsyntax<'a>(i:&'a[u8]) -> IResult<&'a[u8],ObjectSyntax> {
+pub fn parse_der_octetstring_as_slice(i:&[u8]) -> IResult<&[u8],&[u8]> {
+    match parse_der_octetstring(i) {
+        Ok((rem,ref obj)) => {
+            match obj.content {
+                DerObjectContent::OctetString(s) => {
+                    Ok((rem, s))
+                }
+                _ => Err(Err::Error(error_position!(i, ErrorKind::Custom(DER_TAG_ERROR)))),
+            }
+        }
+        Err(e)            => Err(e)
+    }
+}
+
+fn parse_objectsyntax<'a>(i:&'a[u8]) -> IResult<&'a[u8],ObjectSyntax> {
     match der_read_element_header(i) {
-        IResult::Done(rem,hdr) => {
+        Ok((rem,hdr)) => {
             if hdr.is_application() {
                 match hdr.tag {
                     0 => {
@@ -254,7 +287,7 @@ pub fn parse_objectsyntax<'a>(i:&'a[u8]) -> IResult<&'a[u8],ObjectSyntax> {
                     },
                     4 => {
                         let r = der_read_element_content_as(rem, DerTag::OctetString as u8, hdr.len as usize);
-                        r.map(|x| ObjectSyntax::Arbitrary(DerObject::from_obj(x)))
+                        r.map(|(rem,x)| (rem,ObjectSyntax::Arbitrary(DerObject::from_obj(x))))
                     },
                     6 => {
                         map_res!(
@@ -270,9 +303,11 @@ pub fn parse_objectsyntax<'a>(i:&'a[u8]) -> IResult<&'a[u8],ObjectSyntax> {
                             }
                         )
                     },
-                    _ => IResult::Error(error_code!(ErrorKind::Custom(DER_TAG_ERROR))),
+                    _ => Err(Err::Error(error_position!(i, ErrorKind::Custom(DER_TAG_ERROR)))),
+
                 }
             } else {
+                        if hdr.len == 0 { return Ok((rem, ObjectSyntax::Empty)); }
                         map_res!(
                             rem,
                             apply!(der_read_element_content_as, hdr.tag, hdr.len as usize),
@@ -288,8 +323,7 @@ pub fn parse_objectsyntax<'a>(i:&'a[u8]) -> IResult<&'a[u8],ObjectSyntax> {
                         )
             }
         },
-        IResult::Incomplete(i) => IResult::Incomplete(i),
-        IResult::Error(e)      => IResult::Error(e)
+        Err(e)        => Err(e)
     }
 }
 
@@ -302,9 +336,9 @@ pub fn parse_varbind(i:&[u8]) -> IResult<&[u8],SnmpVariable> {
         val: parse_objectsyntax >>
              // eof!() >>
         (
-            SnmpVariable{ oid:oid, val:val }
+            SnmpVariable{ oid, val }
         )
-    ).map(|x| x.1)
+    ).map(|(rem,x)| (rem,x.1))
 }
 
 #[inline]
@@ -312,10 +346,10 @@ pub fn parse_varbind_list(i:&[u8]) -> IResult<&[u8],Vec<SnmpVariable>> {
     parse_der_struct!(
         i,
         TAG DerTag::Sequence,
-        l: many0!(parse_varbind) >>
+        l: many0!(complete!(parse_varbind)) >>
            // eof!() >>
         ( l )
-    ).map(|x| x.1)
+    ).map(|(rem,x)| (rem,x.1))
 }
 
 /// <pre>
@@ -330,19 +364,18 @@ pub fn parse_varbind_list(i:&[u8]) -> IResult<&[u8],Vec<SnmpVariable>> {
 /// </pre>
 pub fn parse_networkaddress(i:&[u8]) -> IResult<&[u8],NetworkAddress> {
     match parse_der(i) {
-        IResult::Done(rem,obj) => {
+        Ok((rem,obj)) => {
             if obj.tag != 0 || obj.class != 0b01 {
-                return IResult::Error(error_code!(ErrorKind::Custom(DER_TAG_ERROR)));
+                return Err(Err::Error(error_position!(i, ErrorKind::Custom(DER_TAG_ERROR))));
             }
             match obj.content {
                 DerObjectContent::Unknown(s) if s.len() == 4 => {
-                    IResult::Done(rem, NetworkAddress::IPv4(Ipv4Addr::new(s[0],s[1],s[2],s[3])))
+                    Ok((rem, NetworkAddress::IPv4(Ipv4Addr::new(s[0],s[1],s[2],s[3]))))
                 },
-                _ => IResult::Error(error_code!(ErrorKind::Custom(DER_TAG_ERROR))),
+                _ => Err(Err::Error(error_position!(i, ErrorKind::Custom(DER_TAG_ERROR)))),
             }
         },
-        IResult::Incomplete(i) => IResult::Incomplete(i),
-        IResult::Error(e)      => IResult::Error(e),
+        Err(e)        => Err(e)
     }
 }
 
@@ -368,18 +401,35 @@ pub fn parse_timeticks(i:&[u8]) -> IResult<&[u8],TimeTicks> {
 
 pub fn parse_snmp_v1_generic_pdu<'a>(pdu: &'a [u8], tag:PduType) -> IResult<&'a[u8],SnmpPdu<'a>> {
     do_parse!(pdu,
-              req_id:       map_res!(parse_der_integer,|x: DerObject| x.as_u32()) >>
-              err:          map_res!(parse_der_integer,|x: DerObject| x.as_u32()) >>
-              err_index:    map_res!(parse_der_integer,|x: DerObject| x.as_u32()) >>
-                            error_if!(true == false, ErrorKind::Custom(128)) >>
+              req_id:       parse_der_u32 >>
+              err:          parse_der_u32 >>
+              err_index:    parse_der_u32 >>
               var_bindings: parse_varbind_list >>
               (
                   SnmpPdu::Generic(
                       SnmpGenericPdu {
                           pdu_type:  tag,
-                          req_id:    req_id,
+                          req_id,
                           err:       ErrorStatus(err),
-                          err_index: err_index,
+                          err_index,
+                          var:       var_bindings
+                      }
+                  )
+              ))
+}
+
+fn parse_snmp_v1_bulk_pdu(pdu: &[u8]) -> IResult<&[u8],SnmpPdu> {
+    do_parse!(pdu,
+              req_id:          parse_der_u32 >>
+              non_repeaters:   parse_der_u32 >>
+              max_repetitions: parse_der_u32 >>
+              var_bindings:    parse_varbind_list >>
+              (
+                  SnmpPdu::Bulk(
+                      SnmpBulkPdu {
+                          req_id,
+                          non_repeaters,
+                          max_repetitions,
                           var:       var_bindings
                       }
                   )
@@ -391,67 +441,23 @@ pub fn parse_snmp_v1_trap_pdu<'a>(pdu: &'a [u8]) -> IResult<&'a[u8],SnmpPdu<'a>>
         pdu,
         enterprise:    map_res!(parse_der_oid, |x: DerObject| x.as_oid_val()) >>
         agent_addr:    parse_networkaddress >>
-        generic_trap:  map_res!(parse_der_integer, |x: DerObject| x.as_u32()) >>
-        specific_trap: map_res!(parse_der_integer, |x: DerObject| x.as_u32()) >>
+        generic_trap:  parse_der_u32 >>
+        specific_trap: parse_der_u32 >>
         timestamp:     parse_timeticks >>
         var_bindings:  parse_varbind_list >>
         (
             SnmpPdu::TrapV1(
                 SnmpTrapPdu {
-                    enterprise:    enterprise,
-                    agent_addr:    agent_addr,
+                    enterprise,
+                    agent_addr,
                     generic_trap:  TrapType(generic_trap as u8),
-                    specific_trap: specific_trap,
-                    timestamp:     timestamp,
+                    specific_trap,
+                    timestamp,
                     var:           var_bindings
                 }
             )
         )
     )
-}
-
-/// Caller is responsible to provide a DerObject of type implicit Sequence, containing
-/// (Integer,OctetString,Unknown)
-pub fn parse_snmp_v1_content<'a>(obj: DerObject<'a>) -> IResult<&'a[u8],SnmpMessage<'a>,SnmpError> {
-    if let DerObjectContent::Sequence(ref v) = obj.content {
-        if v.len() != 3 { return IResult::Error(error_code!(ErrorKind::Custom(SnmpError::InvalidMessage))); };
-        let vers = match v[0].content.as_u32() {
-            Ok (u) if u <= 2 => u,
-            _  => return IResult::Error(error_code!(ErrorKind::Custom(SnmpError::InvalidVersion))),
-        };
-        let community = v[1].content.as_slice().unwrap();
-        let pdu_type = PduType(v[2].tag);
-        let pdu = match v[2].content.as_slice() {
-            Ok(p) => p,
-            _     => return IResult::Error(error_code!(ErrorKind::Custom(SnmpError::InvalidPdu))),
-        };
-        // v[2] is an implicit sequence: class 2 structured 1
-        // tag is the pdu_type
-        let pdu_res = match pdu_type {
-            PduType::GetRequest |
-            PduType::GetNextRequest |
-            PduType::Response |
-            PduType::SetRequest |
-            PduType::Report     => parse_snmp_v1_generic_pdu(pdu, pdu_type),
-            PduType::TrapV1     => parse_snmp_v1_trap_pdu(pdu),
-            _                   => { return IResult::Error(error_code!(ErrorKind::Custom(SnmpError::InvalidPdu))); },
-        };
-        match pdu_res {
-            IResult::Done(rem,r) => {
-                IResult::Done(rem,
-                              SnmpMessage{
-                                  version: vers,
-                                  community: community,
-                                  pdu_type: pdu_type,
-                                  parsed_pdu: r,
-                              }
-                             )
-            },
-            _ => { return IResult::Error(error_code!(ErrorKind::Custom(SnmpError::InvalidPdu))); },
-        }
-    } else {
-        IResult::Error(error_code!(ErrorKind::Custom(SnmpError::InvalidMessage)))
-    }
 }
 
 /// Top-level message
@@ -471,35 +477,46 @@ pub fn parse_snmp_v1_content<'a>(obj: DerObject<'a>) -> IResult<&'a[u8],SnmpMess
 ///                 ANY          -- authentication is being used
 ///         }
 /// </pre>
-pub fn parse_snmp_v1<'a>(i:&'a[u8]) -> IResult<&'a[u8],SnmpMessage<'a>,SnmpError> {
-    flat_map!(
+pub fn parse_snmp_v1(i:&[u8]) -> IResult<&[u8],SnmpMessage> {
+    parse_der_struct!(
         i,
-        fix_error!(SnmpError,
-                   parse_der_sequence_defined!(
-                       parse_der_integer,
-                       parse_der_octetstring,
-                       parse_der // XXX type is ANY
-                       )),
-        parse_snmp_v1_content
-    )
+        TAG DerTag::Sequence,
+        version:   parse_der_u32 >>
+        community: map_res!(
+            parse_der_octetstring_as_slice,
+            |s| str::from_utf8(s)
+        ) >>
+        pdu:       parse_snmp_v1_pdu >>
+        (
+            SnmpMessage{
+                version,
+                community: community.to_string(),
+                pdu
+            }
+        )
+    ).map(|(rem,x)| (rem,x.1))
 }
 
-pub fn parse_snmp_v1_pdu<'a>(i:&'a[u8]) -> IResult<&'a[u8],SnmpPdu<'a>> {
+pub fn parse_snmp_v1_pdu(i:&[u8]) -> IResult<&[u8],SnmpPdu> {
     match der_read_element_header(i) {
-        IResult::Done(rem,hdr) => {
+        Ok((rem,hdr)) => {
             match PduType(hdr.tag) {
                 PduType::GetRequest |
                 PduType::GetNextRequest |
                 PduType::Response |
                 PduType::SetRequest |
-                PduType::Report     => parse_snmp_v1_generic_pdu(rem, PduType(hdr.tag)),
-                PduType::TrapV1     => parse_snmp_v1_trap_pdu(rem),
-                _                   => { return IResult::Error(error_code!(ErrorKind::Custom(128))); },
-                // _                   => { return IResult::Error(error_code!(ErrorKind::Custom(SnmpError::InvalidPdu))); },
+                PduType::InformRequest |
+                PduType::TrapV2 |
+                PduType::Report         => parse_snmp_v1_generic_pdu(rem, PduType(hdr.tag)),
+                PduType::GetBulkRequest => parse_snmp_v1_bulk_pdu(rem),
+                PduType::TrapV1         => parse_snmp_v1_trap_pdu(rem),
+                _                       => Err(Err::Error(error_position!(i, ErrorKind::Custom(128)))),
+                // _                       => { return IResult::Error(error_code!(ErrorKind::Custom(SnmpError::InvalidPdu))); },
             }
         },
-        IResult::Incomplete(i) => IResult::Incomplete(i),
-        IResult::Error(_)      => IResult::Error(error_code!(ErrorKind::Custom(129))),
-        // IResult::Error(_)      => IResult::Error(error_code!(ErrorKind::Custom(SnmpError::InvalidScopedPduData))),
+        Err(e)        => Err(e)
+        // IResult::Incomplete(i) => IResult::Incomplete(i),
+        // IResult::Error(_)      => IResult::Error(error_code!(ErrorKind::Custom(129))),
+        // // IResult::Error(_)      => IResult::Error(error_code!(ErrorKind::Custom(SnmpError::InvalidScopedPduData))),
     }
 }

@@ -13,7 +13,8 @@ use std::fmt;
 use der_parser::*;
 use nom::IResult;
 
-use snmp::{SnmpPdu,parse_snmp_v1_pdu};
+use snmp::{SnmpPdu,parse_der_octetstring_as_slice,parse_snmp_v1_pdu};
+pub use usm::{UsmSecurityParameters,parse_usm_security_parameters};
 
 use error::SnmpError;
 
@@ -39,12 +40,17 @@ impl fmt::Debug for SecurityModel {
 }
 
 #[derive(Debug,PartialEq)]
+pub enum SecurityParameters<'a> {
+    Raw(&'a[u8]),
+    USM(UsmSecurityParameters<'a>)
+}
+
+#[derive(Debug,PartialEq)]
 pub struct SnmpV3Message<'a> {
     pub version: u32,
     pub header_data: HeaderData,
-    pub security_params: &'a[u8],
+    pub security_params: SecurityParameters<'a>,
     pub data: ScopedPduData<'a>,
-    // pub data: DerObject<'a>,
 }
 
 #[derive(Debug,PartialEq)]
@@ -92,37 +98,54 @@ fn parse_snmp_v3_data<'a>(i:&'a[u8], hdr: &HeaderData) -> IResult<&'a[u8],Scoped
     }
 }
 
+fn parse_secp<'a>(x:&DerObject<'a>, hdr:&HeaderData) -> Result<SecurityParameters<'a>,DerError> {
+    match x.as_slice() {
+        Ok(i) => {
+            match hdr.msg_security_model {
+                SecurityModel::USM => {
+                    match parse_usm_security_parameters(i) {
+                        Ok((_,usm)) => Ok(SecurityParameters::USM(usm)),
+                        _           => Err(DerError::DerValueError)
+                    }
+                },
+                _                  => Ok(SecurityParameters::Raw(i))
+            }
+        },
+        _     => Err(DerError::DerValueError)
+    }
+}
+
 pub fn parse_snmp_v3<'a>(i:&'a[u8]) -> IResult<&'a[u8],SnmpV3Message<'a>,SnmpError> {
     fix_error!(
         i,
         SnmpError,
         parse_der_struct!(
             TAG DerTag::Sequence,
-            vers: map_res!(parse_der_integer, |x: DerObject| x.as_u32()) >>
+            vers: parse_der_u32 >>
             hdr:  parse_snmp_v3_headerdata >>
-            secp: map_res!(parse_der_octetstring, |x: DerObject<'a>| x.as_slice()) >>
+            secp: map_res!(parse_der_octetstring, |x: DerObject<'a>| parse_secp(&x,&hdr)) >>
             data: apply!(parse_snmp_v3_data,&hdr) >>
             ({
                 SnmpV3Message{
                     version: vers,
                     header_data: hdr,
                     security_params: secp,
-                    data: data
+                    data
                 }
             })
         )
-    ).map(|x| x.1)
+    ).map(|(rem,x)| (rem,x.1))
 }
 
-fn parse_snmp_v3_headerdata<'a>(i:&'a[u8]) -> IResult<&'a[u8],HeaderData> {
+fn parse_snmp_v3_headerdata(i:&[u8]) -> IResult<&[u8],HeaderData> {
     parse_der_struct!(
         i,
         TAG DerTag::Sequence,
-        id: map_res!(parse_der_integer, |x: DerObject| x.as_u32()) >>
-        sz: map_res!(parse_der_integer, |x: DerObject| x.as_u32()) >>
+        id: parse_der_u32 >>
+        sz: parse_der_u32 >>
         fl: map_res!(parse_der_octetstring, |x: DerObject| x.as_slice().and_then(|s|
             if s.len() == 1 { Ok(s[0]) } else { Err(DerError::DerValueError) })) >>
-        sm: map_res!(parse_der_integer, |x: DerObject| x.as_u32()) >>
+        sm: parse_der_u32 >>
         (
             HeaderData{
                 msg_id: id,
@@ -131,21 +154,21 @@ fn parse_snmp_v3_headerdata<'a>(i:&'a[u8]) -> IResult<&'a[u8],HeaderData> {
                 msg_security_model: SecurityModel(sm),
             }
         )
-    ).map(|x| x.1)
+    ).map(|(rem,x)| (rem,x.1))
 }
 
-fn parse_snmp_v3_plaintext_pdu<'a>(i:&'a[u8]) -> IResult<&'a[u8],ScopedPduData<'a>> {
+fn parse_snmp_v3_plaintext_pdu(i:&[u8]) -> IResult<&[u8],ScopedPduData> {
     parse_der_struct!(
         i,
-        ctx_eng_id: map_res!(parse_der_octetstring, |x: DerObject<'a>| x.as_slice()) >>
-        ctx_name:   map_res!(parse_der_octetstring, |x: DerObject<'a>| x.as_slice()) >>
+        ctx_eng_id: parse_der_octetstring_as_slice >>
+        ctx_name:   parse_der_octetstring_as_slice >>
         data:       parse_snmp_v1_pdu >>
         (
             ScopedPduData::Plaintext(ScopedPdu{
                 ctx_engine_id: ctx_eng_id,
                 ctx_engine_name: ctx_name,
-                data: data
+                data
             })
         )
-    ).map(|x| x.1)
+    ).map(|(rem,x)| (rem,x.1))
 }
